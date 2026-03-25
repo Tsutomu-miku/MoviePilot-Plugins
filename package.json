@@ -253,5 +253,22 @@
       "v1.1.0": "UI 更新",
       "v1.0.0": "首次发布"
     }
+  },
+  "FeishuBot": {
+    "name": "飞书机器人",
+    "description": "飞书机器人，支持影视搜索、资源下载、订阅管理，可选 Agent 智能模式",
+    "labels": "飞书,机器人,搜索,下载,Agent",
+    "version": "2.5.1",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/feishu.png",
+    "author": "madrays",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v2.5.1": "Agent 模式诊断修复：健壮布尔解析、/status 命令、详细路由日志",
+      "v2.5.0": "全面重构为 Agent 架构：多轮 tool calling、会话历史、结构化工具返回",
+      "v2.4.0": "新增 LLM 意图识别（单轮），支持 OpenRouter 免费模型",
+      "v2.3.1": "并发锁保护、防御性类型验证、订阅优化",
+      "v2.3.0": "初始版本：飞书回调、搜索/下载/订阅指令"
+    }
   }
 }
