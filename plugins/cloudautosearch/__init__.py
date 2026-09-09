@@ -574,6 +574,51 @@ def extract_login_cookie(payload: dict) -> Tuple[str, str]:
     return cookie, str(cookie_data.get("UID", ""))
 
 
+def parse_115_folder_items(payload: dict) -> List[Dict[str, str]]:
+    """从 115 文件列表响应中提取直属文件夹的 ID 与名称。"""
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data", [])
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("list") or data.get("items") or []
+    if not isinstance(data, list):
+        return []
+    result: List[Dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        # Web API 中目录以 cid 表示，文件则有 fid 且 cid 代表父目录。
+        if item.get("fid") not in (None, ""):
+            continue
+        folder_id = item.get("cid") or item.get("file_id") or item.get("id")
+        name = item.get("n") or item.get("file_name") or item.get("name")
+        if folder_id in (None, "") or not name:
+            continue
+        result.append({"id": str(folder_id), "name": str(name)})
+    return result
+
+
+def build_115_folder_options(fetch_children, max_folders: int = 2000) -> List[dict]:
+    """广度优先构建可搜索的 115 完整路径下拉选项。"""
+    options = [{"title": "根目录 /", "value": "0"}]
+    queue = [("0", "")]
+    seen = {"0"}
+    while queue and len(options) <= max_folders:
+        parent_id, parent_path = queue.pop(0)
+        for folder in fetch_children(parent_id):
+            folder_id = str(folder.get("id", ""))
+            name = str(folder.get("name", "")).strip()
+            if not folder_id or not name or folder_id in seen:
+                continue
+            seen.add(folder_id)
+            path = f"{parent_path}/{name}" if parent_path else f"/{name}"
+            options.append({"title": path, "value": folder_id})
+            queue.append((folder_id, path))
+            if len(options) > max_folders:
+                break
+    return options
+
+
 # ============================================================================
 # 插件主体
 # ============================================================================
@@ -588,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -757,6 +802,59 @@ class CloudAutoSearch(_PluginBase):
         except Exception as e:
             logger.warning(f"云盘自动搜索：校验 115 登录态失败: {e}")
         return False
+
+
+    def _fetch_folder_children(self, parent_id: str) -> List[Dict[str, str]]:
+        """分页获取指定 115 目录下的直属子目录。"""
+        folders: List[Dict[str, str]] = []
+        offset = 0
+        page_size = 1000
+        while True:
+            r = self._http_get(
+                "https://webapi.115.com/files",
+                params={
+                    "aid": 1,
+                    "cid": str(parent_id or "0"),
+                    "show_dir": 1,
+                    "nf": 1,
+                    "cur": 1,
+                    "limit": page_size,
+                    "offset": offset,
+                    "o": "file_name",
+                    "asc": 1,
+                },
+                timeout=20,
+            )
+            payload = r.json()
+            if not payload.get("state"):
+                raise RuntimeError(payload.get("error") or payload.get("message") or "读取目录失败")
+            page = parse_115_folder_items(payload)
+            folders.extend(page)
+            raw_data = payload.get("data")
+            raw_count = len(raw_data) if isinstance(raw_data, list) else len(page)
+            total = payload.get("count")
+            offset += raw_count
+            if raw_count == 0 or raw_count < page_size:
+                break
+            if isinstance(total, int) and offset >= total:
+                break
+        return folders
+
+    def _get_folder_options(self) -> List[dict]:
+        """为配置页生成 115 目录路径选项，失败时保留当前值。"""
+        fallback = [{"title": "根目录 /", "value": "0"}]
+        if self._target_folder_id and self._target_folder_id != "0":
+            fallback.append({
+                "title": "当前已保存目录（暂时无法读取名称）",
+                "value": str(self._target_folder_id),
+            })
+        if not self._cookie or not self._user_id:
+            return fallback
+        try:
+            return build_115_folder_options(self._fetch_folder_children)
+        except Exception as e:
+            logger.warning(f"云盘自动搜索：读取 115 目录列表失败: {e}")
+            return fallback
 
     # ------------------------------------------------------- 115 offline task
     def _submit_offline_task(self, magnet: str) -> bool:
@@ -1069,6 +1167,12 @@ class CloudAutoSearch(_PluginBase):
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        folder_options = self._get_folder_options()
+        folder_hint = (
+            "已读取 115 目录，可输入名称搜索；保存时自动记录对应目录 ID。"
+            if len(folder_options) > 1
+            else "请先完成 115 扫码登录，然后重新打开配置页加载目录。"
+        )
         return [
             {
                 "component": "VRow",
@@ -1197,10 +1301,15 @@ class CloudAutoSearch(_PluginBase):
                         "content": [
                             {"component": "VRow", "class": "mb-2", "content": [
                                 {"component": "VCol", "props": {"cols": 12}, "content": [
-                                    {"component": "VTextField", "props": {
+                                    {"component": "VAutocomplete", "props": {
                                         "model": "target_folder_id",
-                                        "label": "115 目标文件夹 ID",
-                                        "placeholder": "如 0", "variant": "outlined"}}]}]},
+                                        "label": "115 目标目录",
+                                        "items": folder_options,
+                                        "variant": "outlined",
+                                        "clearable": False,
+                                        "persistent-hint": True,
+                                        "hint": folder_hint,
+                                        "no-data-text": "未找到匹配目录"}}]}]},
                         ],
                     },
                 ],

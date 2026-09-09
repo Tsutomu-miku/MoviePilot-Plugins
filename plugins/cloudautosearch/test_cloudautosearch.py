@@ -367,3 +367,45 @@ class TestLoginCookieExtraction:
             "data": {"UID": "u", "CID": "c", "SEID": "s"},
         })
         assert cookie == "UID=u; CID=c; SEID=s"
+
+
+# ===========================================================================
+# 8. 115 目录选择
+# ===========================================================================
+class TestFolderSelector:
+    def test_parse_folder_items_skips_files(self):
+        payload = {"state": True, "data": [
+            {"cid": "11", "n": "动漫"},
+            {"fid": "99", "cid": "11", "n": "episode.mkv"},
+            {"cid": "12", "n": "电影"},
+        ]}
+        assert cas.parse_115_folder_items(payload) == [
+            {"id": "11", "name": "动漫"},
+            {"id": "12", "name": "电影"},
+        ]
+
+    def test_parse_nested_folder_items(self):
+        payload = {"state": True, "data": {"list": [{"cid": 7, "n": "云下载"}]}}
+        assert cas.parse_115_folder_items(payload) == [{"id": "7", "name": "云下载"}]
+
+    def test_build_folder_options_uses_full_paths(self):
+        tree = {
+            "0": [{"id": "1", "name": "下载"}, {"id": "2", "name": "影视"}],
+            "1": [{"id": "3", "name": "动漫"}],
+            "2": [],
+            "3": [],
+        }
+        options = cas.build_115_folder_options(lambda parent: tree[parent])
+        assert options == [
+            {"title": "根目录 /", "value": "0"},
+            {"title": "/下载", "value": "1"},
+            {"title": "/影视", "value": "2"},
+            {"title": "/下载/动漫", "value": "3"},
+        ]
+
+    def test_build_folder_options_stops_cycles(self):
+        tree = {"0": [{"id": "1", "name": "A"}], "1": [{"id": "1", "name": "A"}]}
+        assert cas.build_115_folder_options(lambda parent: tree[parent]) == [
+            {"title": "根目录 /", "value": "0"},
+            {"title": "/A", "value": "1"},
+        ]
