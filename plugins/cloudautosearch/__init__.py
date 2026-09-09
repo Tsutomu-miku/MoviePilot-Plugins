@@ -549,7 +549,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -1009,17 +1009,17 @@ class CloudAutoSearch(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {"path": "/CloudAutoSearch/qrcode", "endpoint": self.api_qrcode, "methods": ["GET"],
+            {"path": "/qrcode", "endpoint": self.api_qrcode, "methods": ["GET"],
              "summary": "获取 115 登录二维码"},
-            {"path": "/CloudAutoSearch/qrcode_status", "endpoint": self.api_qrcode_status,
+            {"path": "/qrcode_status", "endpoint": self.api_qrcode_status,
              "methods": ["GET"], "summary": "查询扫码状态"},
-            {"path": "/CloudAutoSearch/logout", "endpoint": self.api_logout, "methods": ["POST"],
+            {"path": "/logout", "endpoint": self.api_logout, "methods": ["POST"],
              "summary": "退出 115 登录"},
-            {"path": "/CloudAutoSearch/status", "endpoint": self.api_status, "methods": ["GET"],
+            {"path": "/status", "endpoint": self.api_status, "methods": ["GET"],
              "summary": "插件状态"},
-            {"path": "/CloudAutoSearch/run", "endpoint": self.api_run, "methods": ["POST"],
+            {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
              "summary": "手动触发运行"},
-            {"path": "/CloudAutoSearch/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
+            {"path": "/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
              "summary": "测试 RSS 链接"},
         ]
 

@@ -275,14 +275,15 @@
     "name": "云盘自动搜索",
     "description": "多 RSS 聚合搜索，自动提交 115 离线下载",
     "labels": "RSS,115,离线下载,自动搜索",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "",
     "author": "Tsutomu",
     "level": 1,
     "v2": true,
     "history": {
       "v1.0.0": "首次发布",
-      "v1.0.1": "修复插件 ID、API 路由命名空间与 115 凭据私有存储"
+      "v1.0.1": "修复插件 ID、API 路由命名空间与 115 凭据私有存储",
+      "v1.0.2": "修复 MoviePilot 自动插件前缀下的动态 API 路由"
     }
   }
 }
