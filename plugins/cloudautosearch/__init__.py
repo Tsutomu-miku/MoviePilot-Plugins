@@ -554,6 +554,26 @@ def parse_qrcode_status(payload: dict) -> Tuple[Optional[int], str]:
     return None, ""
 
 
+def extract_login_cookie(payload: dict) -> Tuple[str, str]:
+    """从 115 扫码登录结果提取 Cookie；无完整三件套时拒绝保存。"""
+    if not isinstance(payload, dict):
+        return "", ""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        data = payload
+    cookie_data = data.get("cookie")
+    if not isinstance(cookie_data, dict):
+        cookie_data = data
+    required = ("UID", "CID", "SEID")
+    if not all(cookie_data.get(key) for key in required):
+        return "", ""
+    ordered_keys = ("UID", "CID", "SEID", "KID")
+    cookie = "; ".join(
+        f"{key}={cookie_data[key]}" for key in ordered_keys if cookie_data.get(key)
+    )
+    return cookie, str(cookie_data.get("UID", ""))
+
+
 # ============================================================================
 # 插件主体
 # ============================================================================
@@ -568,7 +588,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -956,22 +976,23 @@ class CloudAutoSearch(_PluginBase):
                     timeout=15,
                 )
                 j2 = r2.json()
-                if j2.get("state") and j2.get("data"):
-                    d = j2["data"]
-                    cookie = (
-                        f"UID={d.get('UID')}; CID={d.get('CID')}; "
-                        f"SEID={d.get('SEID')}; KID={d.get('KID')}"
-                    )
-                    self._cookie = cookie
-                    self._user_id = str(d.get("UID", ""))
-                    self.save_data("credential", {
-                        "cookie": self._cookie, "user_id": self._user_id,
-                        "username": self._username,
-                    })
-                    self.__update_config()
-                    logger.info(f"云盘自动搜索：115 扫码登录成功 cookie={mask_cookie(cookie)}")
-                    result["cookie_saved"] = True
-                    result["user_id"] = self._user_id
+                if j2.get("state"):
+                    cookie, user_id = extract_login_cookie(j2)
+                    if not cookie:
+                        result["message"] = "登录结果未返回完整 Cookie"
+                    else:
+                        self._cookie = cookie
+                        self._user_id = user_id
+                        self.save_data("credential", {
+                            "cookie": self._cookie, "user_id": self._user_id,
+                            "username": self._username,
+                        })
+                        self.__update_config()
+                        logger.info(
+                            f"云盘自动搜索：115 扫码登录成功 cookie={mask_cookie(cookie)}"
+                        )
+                        result["cookie_saved"] = True
+                        result["user_id"] = self._user_id
             except Exception as e:
                 result["message"] = f"登录换取 cookie 失败: {e}"
         return schemas.Response(success=True, data=result)
@@ -1034,17 +1055,17 @@ class CloudAutoSearch(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return [
             {"path": "/qrcode", "endpoint": self.api_qrcode, "methods": ["GET"],
-             "summary": "获取 115 登录二维码"},
+             "auth": "bear", "summary": "获取 115 登录二维码"},
             {"path": "/qrcode_status", "endpoint": self.api_qrcode_status,
-             "methods": ["GET"], "summary": "查询扫码状态"},
+             "methods": ["GET"], "auth": "bear", "summary": "查询扫码状态"},
             {"path": "/logout", "endpoint": self.api_logout, "methods": ["POST"],
-             "summary": "退出 115 登录"},
+             "auth": "bear", "summary": "退出 115 登录"},
             {"path": "/status", "endpoint": self.api_status, "methods": ["GET"],
-             "summary": "插件状态"},
+             "auth": "bear", "summary": "插件状态"},
             {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
-             "summary": "手动触发运行"},
+             "auth": "bear", "summary": "手动触发运行"},
             {"path": "/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
-             "summary": "测试 RSS 链接"},
+             "auth": "bear", "summary": "测试 RSS 链接"},
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:

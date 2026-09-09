@@ -343,3 +343,27 @@ class TestQrcodeCompatibility:
             "proxies": {"http": proxy, "https": proxy}
         }
         assert cas.get_proxy_kwargs("") == {}
+
+
+class TestLoginCookieExtraction:
+    def test_nested_cookie_dict_is_extracted(self):
+        cookie, user_id = cas.extract_login_cookie({
+            "state": True,
+            "data": {"cookie": {
+                "UID": "123_A1_1", "CID": "cid", "SEID": "seid", "KID": "kid"
+            }},
+        })
+        assert cookie == "UID=123_A1_1; CID=cid; SEID=seid; KID=kid"
+        assert user_id == "123_A1_1"
+
+    def test_incomplete_cookie_is_rejected(self):
+        assert cas.extract_login_cookie({
+            "state": True, "data": {"cookie": {"UID": None, "CID": None}}
+        }) == ("", "")
+
+    def test_legacy_flat_cookie_remains_compatible(self):
+        cookie, _ = cas.extract_login_cookie({
+            "state": True,
+            "data": {"UID": "u", "CID": "c", "SEID": "s"},
+        })
+        assert cookie == "UID=u; CID=c; SEID=s"
