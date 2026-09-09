@@ -377,6 +377,7 @@ class TestFolderSelector:
         payload = {"state": True, "data": [
             {"cid": "11", "n": "动漫"},
             {"fid": "99", "cid": "11", "n": "episode.mkv"},
+            {"fid": "", "cid": "11", "n": "empty-fid-file.mp4"},
             {"cid": "12", "n": "电影"},
         ]}
         assert cas.parse_115_folder_items(payload) == [

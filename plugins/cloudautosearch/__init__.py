@@ -587,8 +587,8 @@ def parse_115_folder_items(payload: dict) -> List[Dict[str, str]]:
     for item in data:
         if not isinstance(item, dict):
             continue
-        # Web API 中目录以 cid 表示，文件则有 fid 且 cid 代表父目录。
-        if item.get("fid") not in (None, ""):
+        # 115 Web API：目录完全没有 fid 键；文件有 fid 键（值即使为空也仍是文件）。
+        if "fid" in item:
             continue
         folder_id = item.get("cid") or item.get("file_id") or item.get("id")
         name = item.get("n") or item.get("file_name") or item.get("name")
@@ -633,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
