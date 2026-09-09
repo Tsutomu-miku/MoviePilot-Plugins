@@ -321,3 +321,25 @@ class TestRssParse:
         # 只有包含 2024 的条目通过
         assert kept == ["Test.Movie.2024.2160p.WEB-DL"]
         assert len(history) == 1
+
+
+# ===========================================================================
+# 7. 115 扫码状态与代理
+# ===========================================================================
+class TestQrcodeCompatibility:
+    def test_nested_status_is_parsed(self):
+        assert cas.parse_qrcode_status(
+            {"state": True, "data": {"status": 2}, "msg": "ok"}
+        ) == (2, "ok")
+
+    def test_top_level_status_remains_compatible(self):
+        assert cas.parse_qrcode_status(
+            {"status": 1, "msg": "scanned"}
+        ) == (1, "scanned")
+
+    def test_moviepilot_proxy_is_applied_to_both_schemes(self):
+        proxy = "http://mihomo:7890"
+        assert cas.get_proxy_kwargs(proxy) == {
+            "proxies": {"http": proxy, "https": proxy}
+        }
+        assert cas.get_proxy_kwargs("") == {}

@@ -69,6 +69,7 @@ except Exception:  # pragma: no cover - 仅在无 MoviePilot 的测试环境触�
 
     class _StubSettings:
         TZ = "Asia/Shanghai"
+        PROXY_HOST = ""
 
     settings = _StubSettings()
 
@@ -535,6 +536,24 @@ def mask_cookie(cookie: str) -> str:
     return s[:6] + "***"
 
 
+def get_proxy_kwargs(proxy_host: str) -> dict:
+    """把 MoviePilot 的 PROXY_HOST 转换为 requests 可用参数。"""
+    proxy_host = (proxy_host or "").strip()
+    if not proxy_host:
+        return {}
+    return {"proxies": {"http": proxy_host, "https": proxy_host}}
+
+
+def parse_qrcode_status(payload: dict) -> Tuple[Optional[int], str]:
+    """兼容 115 扫码接口的嵌套 data.status 与旧式顶层 status。"""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict) and data.get("status") is not None:
+        return data.get("status"), data.get("msg") or payload.get("msg", "")
+    if isinstance(payload, dict):
+        return payload.get("status"), payload.get("msg", "")
+    return None, ""
+
+
 # ============================================================================
 # 插件主体
 # ============================================================================
@@ -549,7 +568,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -661,14 +680,19 @@ class CloudAutoSearch(_PluginBase):
     def _http_get(self, url: str, params: Optional[dict] = None, timeout: int = 30):
         if requests is None:
             raise RuntimeError("requests 库不可用")
-        return requests.get(url, params=params, headers=self._headers(), timeout=timeout)
+        return requests.get(
+            url, params=params, headers=self._headers(), timeout=timeout,
+            **get_proxy_kwargs(getattr(settings, "PROXY_HOST", "")),
+        )
 
     def _http_post(self, url: str, data: Optional[dict] = None,
                    params: Optional[dict] = None, timeout: int = 30):
         if requests is None:
             raise RuntimeError("requests 库不可用")
-        return requests.post(url, params=params, data=data, headers=self._headers(),
-                             timeout=timeout)
+        return requests.post(
+            url, params=params, data=data, headers=self._headers(), timeout=timeout,
+            **get_proxy_kwargs(getattr(settings, "PROXY_HOST", "")),
+        )
 
     # ------------------------------------------------------------- 115 login
     def _fetch_qrcode_token(self) -> Optional[Dict[str, Any]]:
@@ -920,14 +944,14 @@ class CloudAutoSearch(_PluginBase):
         except Exception as e:
             return schemas.Response(success=False, message=f"查询失败: {e}")
 
-        status = j.get("status")
-        result = {"status": status, "message": j.get("msg", "")}
+        status, status_message = parse_qrcode_status(j)
+        result = {"status": status, "message": status_message}
 
         if status == 2:
             # 已确认登录，换取 cookie
             try:
                 r2 = self._http_post(
-                    "https://passportapi.115.com/app/1.0/web/1.0/login/qrcode",
+                    "https://qrcodeapi.115.com/app/1.0/web/1.0/login/qrcode/",
                     data={"account": uid, "app": "web"},
                     timeout=15,
                 )
