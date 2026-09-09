@@ -55,6 +55,9 @@ except Exception:  # pragma: no cover - 仅在无 MoviePilot 的测试环境触�
         def save_data(self, key: str, value: Any) -> None:
             pass
 
+        def del_data(self, key: str) -> None:
+            pass
+
         def update_config(self, config: dict) -> None:
             pass
 
@@ -588,9 +591,16 @@ class CloudAutoSearch(_PluginBase):
             self._min_size_gb = config.get("min_size_gb") or ""
             self._max_size_gb = config.get("max_size_gb") or ""
             self._target_folder_id = config.get("target_folder_id") or ""
-            self._cookie = config.get("cookie") or ""
-            self._user_id = config.get("user_id") or ""
-            self._username = config.get("username") or ""
+            credential = self.get_data("credential") or {}
+            self._cookie = credential.get("cookie") or config.get("cookie") or ""
+            self._user_id = credential.get("user_id") or config.get("user_id") or ""
+            self._username = credential.get("username") or config.get("username") or ""
+            if self._cookie and not credential:
+                self.save_data("credential", {
+                    "cookie": self._cookie, "user_id": self._user_id,
+                    "username": self._username,
+                })
+                self.__update_config()
 
         self.stop_service()
 
@@ -638,9 +648,6 @@ class CloudAutoSearch(_PluginBase):
                 "min_size_gb": self._min_size_gb,
                 "max_size_gb": self._max_size_gb,
                 "target_folder_id": self._target_folder_id,
-                "cookie": self._cookie,
-                "user_id": self._user_id,
-                "username": self._username,
             }
         )
 
@@ -933,6 +940,10 @@ class CloudAutoSearch(_PluginBase):
                     )
                     self._cookie = cookie
                     self._user_id = str(d.get("UID", ""))
+                    self.save_data("credential", {
+                        "cookie": self._cookie, "user_id": self._user_id,
+                        "username": self._username,
+                    })
                     self.__update_config()
                     logger.info(f"云盘自动搜索：115 扫码登录成功 cookie={mask_cookie(cookie)}")
                     result["cookie_saved"] = True
@@ -945,6 +956,7 @@ class CloudAutoSearch(_PluginBase):
         self._cookie = ""
         self._user_id = ""
         self._username = ""
+        self.del_data("credential")
         self.__update_config()
         logger.info("云盘自动搜索：已退出 115 登录")
         return schemas.Response(success=True, message="已退出登录")
@@ -997,17 +1009,17 @@ class CloudAutoSearch(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
-            {"path": "/qrcode", "endpoint": self.api_qrcode, "methods": ["GET"],
+            {"path": "/CloudAutoSearch/qrcode", "endpoint": self.api_qrcode, "methods": ["GET"],
              "summary": "获取 115 登录二维码"},
-            {"path": "/qrcode_status", "endpoint": self.api_qrcode_status,
+            {"path": "/CloudAutoSearch/qrcode_status", "endpoint": self.api_qrcode_status,
              "methods": ["GET"], "summary": "查询扫码状态"},
-            {"path": "/logout", "endpoint": self.api_logout, "methods": ["POST"],
+            {"path": "/CloudAutoSearch/logout", "endpoint": self.api_logout, "methods": ["POST"],
              "summary": "退出 115 登录"},
-            {"path": "/status", "endpoint": self.api_status, "methods": ["GET"],
+            {"path": "/CloudAutoSearch/status", "endpoint": self.api_status, "methods": ["GET"],
              "summary": "插件状态"},
-            {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
+            {"path": "/CloudAutoSearch/run", "endpoint": self.api_run, "methods": ["POST"],
              "summary": "手动触发运行"},
-            {"path": "/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
+            {"path": "/CloudAutoSearch/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
              "summary": "测试 RSS 链接"},
         ]
 
@@ -1158,9 +1170,6 @@ class CloudAutoSearch(_PluginBase):
             "min_size_gb": "",
             "max_size_gb": "",
             "target_folder_id": "",
-            "cookie": "",
-            "user_id": "",
-            "username": "",
         }
 
     def get_page(self) -> List[dict]:
