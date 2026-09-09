@@ -271,17 +271,18 @@
       "v2.3.0": "初始版本：飞书回调、搜索/下载/订阅指令"
     }
   },
-  "cloudautosearch": {
+  "CloudAutoSearch": {
     "name": "云盘自动搜索",
     "description": "多 RSS 聚合搜索，自动提交 115 离线下载",
     "labels": "RSS,115,离线下载,自动搜索",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "",
     "author": "Tsutomu",
     "level": 1,
     "v2": true,
     "history": {
-      "v1.0.0": "首次发布"
+      "v1.0.0": "首次发布",
+      "v1.0.1": "修复插件 ID、API 路由命名空间与 115 凭据私有存储"
     }
   }
 }
