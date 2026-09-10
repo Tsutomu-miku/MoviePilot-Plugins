@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-CloudAutoSearch（云盘自动搜索）MoviePilot 插件
+CloudAutoSearch（115 RSS 离线下载）MoviePilot 插件
 
 功能：
 - 定时轮询多条 RSS（每行一个 URL）
@@ -627,13 +627,13 @@ UA_115 = "Mozilla/5.0 115Browser/27.0.5.7"
 
 class CloudAutoSearch(_PluginBase):
     # 插件名称
-    plugin_name = "云盘自动搜索"
+    plugin_name = "115 RSS 离线下载"
     # 插件描述
-    plugin_desc = "多 RSS 聚合搜索，自动提交 115 离线下载"
+    plugin_desc = "订阅 RSS 并自动提交种子到 115 离线下载"
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -661,7 +661,10 @@ class CloudAutoSearch(_PluginBase):
 
     _scheduler = None
     _run_lock = threading.Lock()
+    _folder_refresh_lock = threading.Lock()
     _qrcode_token: Dict[str, Any] = {}
+    _folder_options_cache: List[dict] = []
+    _folder_cache_updated_at: str = ""
 
     # ------------------------------------------------------------------ init
     def init_plugin(self, config: Optional[dict] = None):
@@ -686,6 +689,19 @@ class CloudAutoSearch(_PluginBase):
                 })
                 self.__update_config()
 
+        folder_cache = self.get_data("folder_options") or {}
+        if isinstance(folder_cache, dict):
+            items = folder_cache.get("items")
+            self._folder_options_cache = items if isinstance(items, list) else []
+            self._folder_cache_updated_at = str(folder_cache.get("updated_at") or "")
+        else:
+            self._folder_options_cache = []
+            self._folder_cache_updated_at = ""
+
+        # 目录树可能包含数百个目录，必须后台刷新，绝不能阻塞配置页。
+        if self._cookie and self._user_id:
+            self._start_folder_refresh()
+
         self.stop_service()
 
         if not self._enabled and not self._onlyonce:
@@ -694,9 +710,9 @@ class CloudAutoSearch(_PluginBase):
         self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
         if self._onlyonce:
-            logger.info("云盘自动搜索：立即运行一次")
+            logger.info("115 RSS 离线下载：立即运行一次")
             self._scheduler.add_job(
-                name="云盘自动搜索-立即",
+                name="115 RSS 离线下载-立即",
                 func=self._run_task,
                 trigger="date",
                 run_date=datetime.datetime.now()
@@ -708,13 +724,13 @@ class CloudAutoSearch(_PluginBase):
         if self._enabled and self._cron:
             try:
                 self._scheduler.add_job(
-                    name="云盘自动搜索",
+                    name="115 RSS 离线下载",
                     func=self._run_task,
                     trigger=CronTrigger.from_crontab(self._cron),
                 )
-                logger.info(f"云盘自动搜索：已按 cron '{self._cron}' 注册定时任务")
+                logger.info(f"115 RSS 离线下载：已按 cron '{self._cron}' 注册定时任务")
             except Exception as err:
-                logger.error(f"云盘自动搜索：cron 配置错误: {err}")
+                logger.error(f"115 RSS 离线下载：cron 配置错误: {err}")
 
         if self._scheduler.get_jobs():
             self._scheduler.print_jobs()
@@ -769,7 +785,7 @@ class CloudAutoSearch(_PluginBase):
             if j.get("state") and j.get("data"):
                 return j["data"]
         except Exception as e:
-            logger.error(f"云盘自动搜索：获取 115 二维码 token 失败: {e}")
+            logger.error(f"115 RSS 离线下载：获取 115 二维码 token 失败: {e}")
         return None
 
     def _qrcode_to_data_url(self, content: str) -> str:
@@ -800,7 +816,7 @@ class CloudAutoSearch(_PluginBase):
                     self._user_id = str(j["data"]["user_id"])
                 return True
         except Exception as e:
-            logger.warning(f"云盘自动搜索：校验 115 登录态失败: {e}")
+            logger.warning(f"115 RSS 离线下载：校验 115 登录态失败: {e}")
         return False
 
 
@@ -841,26 +857,48 @@ class CloudAutoSearch(_PluginBase):
         return folders
 
     def _get_folder_options(self) -> List[dict]:
-        """为配置页生成 115 目录路径选项，失败时保留当前值。"""
+        """只读本地缓存，绝不在配置页请求 115。"""
+        cached = self._folder_options_cache
+        if isinstance(cached, list) and cached:
+            return list(cached)
         fallback = [{"title": "根目录 /", "value": "0"}]
         if self._target_folder_id and self._target_folder_id != "0":
             fallback.append({
-                "title": "当前已保存目录（暂时无法读取名称）",
+                "title": "当前已保存目录（目录缓存正在后台刷新）",
                 "value": str(self._target_folder_id),
             })
-        if not self._cookie or not self._user_id:
-            return fallback
+        return fallback
+
+    def _start_folder_refresh(self) -> bool:
+        """启动单个后台目录刷新任务；配置页无需等待。"""
+        if not self._cookie or not self._user_id or self._folder_refresh_lock.locked():
+            return False
+        threading.Thread(target=self._refresh_folder_cache, daemon=True).start()
+        return True
+
+    def _refresh_folder_cache(self):
+        if not self._folder_refresh_lock.acquire(blocking=False):
+            return
         try:
-            return build_115_folder_options(self._fetch_folder_children)
+            options = build_115_folder_options(self._fetch_folder_children)
+            updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._folder_options_cache = options
+            self._folder_cache_updated_at = updated_at
+            self.save_data("folder_options", {
+                "items": options,
+                "updated_at": updated_at,
+            })
+            logger.info(f"115 RSS 离线下载：已后台缓存 {len(options)} 个 115 目录")
         except Exception as e:
-            logger.warning(f"云盘自动搜索：读取 115 目录列表失败: {e}")
-            return fallback
+            logger.warning(f"115 RSS 离线下载：后台刷新 115 目录失败: {e}")
+        finally:
+            self._folder_refresh_lock.release()
 
     # ------------------------------------------------------- 115 offline task
     def _submit_offline_task(self, magnet: str) -> bool:
         """通过 m115 加密提交 magnet 到 115 离线下载。成功返回 True。"""
         if not self._cookie or not self._user_id:
-            logger.error("云盘自动搜索：未登录 115，无法提交离线任务")
+            logger.error("115 RSS 离线下载：未登录 115，无法提交离线任务")
             return False
         try:
             key = generate_key()
@@ -890,17 +928,17 @@ class CloudAutoSearch(_PluginBase):
                     resp = json.loads(decoded.decode("utf-8", errors="replace"))
                     if resp.get("state"):
                         return True
-                    logger.warning(f"云盘自动搜索：115 返回失败: {resp}")
+                    logger.warning(f"115 RSS 离线下载：115 返回失败: {resp}")
                 except Exception:
-                    logger.warning("云盘自动搜索：115 响应解密后解析失败")
+                    logger.warning("115 RSS 离线下载：115 响应解密后解析失败")
                     return False
             # 兼容未加密响应
             if j.get("state"):
                 return True
-            logger.warning(f"云盘自动搜索：提交离线任务返回: {j}")
+            logger.warning(f"115 RSS 离线下载：提交离线任务返回: {j}")
             return False
         except Exception as e:
-            logger.error(f"云盘自动搜索：提交离线任务异常: {e}")
+            logger.error(f"115 RSS 离线下载：提交离线任务异常: {e}")
             return False
 
     # ----------------------------------------------------------------- runner
@@ -923,12 +961,12 @@ class CloudAutoSearch(_PluginBase):
             magnet, _name = torrent_to_magnet(r.content)
             return magnet, extract_info_hash_from_magnet(magnet)
         except Exception as e:
-            logger.error(f"云盘自动搜索：解析 torrent 失败 {url}: {e}")
+            logger.error(f"115 RSS 离线下载：解析 torrent 失败 {url}: {e}")
             return None, None
 
     def _run_task(self, manual: bool = False):
         if not self._run_lock.acquire(blocking=False):
-            logger.warning("云盘自动搜索：已有任务在运行，跳过本次")
+            logger.warning("115 RSS 离线下载：已有任务在运行，跳过本次")
             return
         stats = {
             "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -944,7 +982,7 @@ class CloudAutoSearch(_PluginBase):
         }
         try:
             if not self._check_login():
-                logger.warning("云盘自动搜索：115 未登录或登录态失效，跳过")
+                logger.warning("115 RSS 离线下载：115 未登录或登录态失效，跳过")
                 stats["status"] = "skipped"
                 stats["error"] = "未登录"
                 return
@@ -964,7 +1002,7 @@ class CloudAutoSearch(_PluginBase):
                     r = self._http_get(rss_url, timeout=30)
                     items = parse_rss_items(r.content)
                 except Exception as e:
-                    logger.error(f"云盘自动搜索：RSS 解析失败 {rss_url}: {e}")
+                    logger.error(f"115 RSS 离线下载：RSS 解析失败 {rss_url}: {e}")
                     continue
 
                 for item in items:
@@ -995,24 +1033,24 @@ class CloudAutoSearch(_PluginBase):
                         self.save_data("dedup_history", dedup_history)
                         stats["submitted"] += 1
                         logger.info(
-                            f"云盘自动搜索：已提交 {item.get('title', '')} "
+                            f"115 RSS 离线下载：已提交 {item.get('title', '')} "
                             f"({info_hash})"
                         )
                     else:
                         stats["failed"] += 1
                         logger.warning(
-                            f"云盘自动搜索：提交失败，下轮重试 {item.get('title','')} "
+                            f"115 RSS 离线下载：提交失败，下轮重试 {item.get('title','')} "
                             f"({info_hash})"
                         )
 
             logger.info(
-                f"云盘自动搜索：完成 共{stats['items_total']} 过滤{stats['filtered']} "
+                f"115 RSS 离线下载：完成 共{stats['items_total']} 过滤{stats['filtered']} "
                 f"重复{stats['duplicated']} 成功{stats['submitted']} 失败{stats['failed']}"
             )
         except Exception as e:
             stats["status"] = "failed"
             stats["error"] = str(e)
-            logger.error(f"云盘自动搜索：运行异常: {e}\n{traceback.format_exc()}")
+            logger.error(f"115 RSS 离线下载：运行异常: {e}\n{traceback.format_exc()}")
         finally:
             stats["end_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -1086,8 +1124,9 @@ class CloudAutoSearch(_PluginBase):
                             "username": self._username,
                         })
                         self.__update_config()
+                        self._start_folder_refresh()
                         logger.info(
-                            f"云盘自动搜索：115 扫码登录成功 cookie={mask_cookie(cookie)}"
+                            f"115 RSS 离线下载：115 扫码登录成功 cookie={mask_cookie(cookie)}"
                         )
                         result["cookie_saved"] = True
                         result["user_id"] = self._user_id
@@ -1100,8 +1139,11 @@ class CloudAutoSearch(_PluginBase):
         self._user_id = ""
         self._username = ""
         self.del_data("credential")
+        self.del_data("folder_options")
+        self._folder_options_cache = []
+        self._folder_cache_updated_at = ""
         self.__update_config()
-        logger.info("云盘自动搜索：已退出 115 登录")
+        logger.info("115 RSS 离线下载：已退出 115 登录")
         return schemas.Response(success=True, message="已退出登录")
 
     def api_status(self):
@@ -1117,12 +1159,24 @@ class CloudAutoSearch(_PluginBase):
                 "last_run": run_log[0] if run_log else None,
                 "total_submitted": len(dedup_history),
                 "rss_count": rss_count,
+                "folder_count": len(self._folder_options_cache or []),
+                "folder_cache_updated_at": self._folder_cache_updated_at,
+                "folder_refreshing": self._folder_refresh_lock.locked(),
             },
         )
 
     def api_run(self):
         threading.Thread(target=self._run_task, kwargs={"manual": True}, daemon=True).start()
         return schemas.Response(success=True, message="已触发手动运行")
+
+    def api_refresh_folders(self):
+        if not self._cookie or not self._user_id:
+            return schemas.Response(success=False, message="请先登录 115")
+        started = self._start_folder_refresh()
+        return schemas.Response(
+            success=True,
+            message="已开始后台刷新目录" if started else "目录刷新已在运行",
+        )
 
     def api_test_rss(self, url: str = ""):
         url = (url or "").strip()
@@ -1162,6 +1216,8 @@ class CloudAutoSearch(_PluginBase):
              "auth": "bear", "summary": "插件状态"},
             {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
              "auth": "bear", "summary": "手动触发运行"},
+            {"path": "/refresh_folders", "endpoint": self.api_refresh_folders,
+             "methods": ["POST"], "auth": "bear", "summary": "后台刷新 115 目录缓存"},
             {"path": "/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
              "auth": "bear", "summary": "测试 RSS 链接"},
         ]
@@ -1169,9 +1225,10 @@ class CloudAutoSearch(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         folder_options = self._get_folder_options()
         folder_hint = (
-            "已读取 115 目录，可输入名称搜索；保存时自动记录对应目录 ID。"
+            f"已缓存 {len(folder_options)} 个 115 目录，可输入名称搜索；"
+            f"更新时间：{self._folder_cache_updated_at or '后台刷新中'}。"
             if len(folder_options) > 1
-            else "请先完成 115 扫码登录，然后重新打开配置页加载目录。"
+            else "目录正在后台加载；配置页不会等待，请稍后重新打开。"
         )
         return [
             {
@@ -1376,5 +1433,5 @@ class CloudAutoSearch(_PluginBase):
                 if getattr(self._scheduler, "running", False):
                     self._scheduler.shutdown(wait=False)
             except Exception as e:
-                logger.error(f"云盘自动搜索：停止定时任务失败: {e}")
+                logger.error(f"115 RSS 离线下载：停止定时任务失败: {e}")
             self._scheduler = None

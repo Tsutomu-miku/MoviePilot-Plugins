@@ -410,3 +410,30 @@ class TestFolderSelector:
             {"title": "根目录 /", "value": "0"},
             {"title": "/A", "value": "1"},
         ]
+
+
+class TestNonBlockingFolderForm:
+    def test_get_form_reads_cache_without_network(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._cookie = "UID=u; CID=c; SEID=s"
+        plugin._user_id = "u"
+        plugin._folder_options_cache = [
+            {"title": "根目录 /", "value": "0"},
+            {"title": "/动漫", "value": "11"},
+        ]
+        plugin._folder_cache_updated_at = "2026-09-11 01:00:00"
+        plugin._fetch_folder_children = lambda _parent: (_ for _ in ()).throw(
+            AssertionError("get_form must not access network")
+        )
+        form, defaults = plugin.get_form()
+        assert defaults["target_folder_id"] == plugin._target_folder_id
+        assert "VAutocomplete" in str(form)
+        assert "/动漫" in str(form)
+
+    def test_empty_cache_returns_immediately_with_root(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._folder_options_cache = []
+        plugin._target_folder_id = ""
+        assert plugin._get_folder_options() == [
+            {"title": "根目录 /", "value": "0"}
+        ]
