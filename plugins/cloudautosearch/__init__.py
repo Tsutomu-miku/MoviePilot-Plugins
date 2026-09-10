@@ -633,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.0.10"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -802,6 +802,12 @@ class CloudAutoSearch(_PluginBase):
             return ""
 
     def _check_login(self) -> bool:
+        """校验 115 登录态。
+
+        实测 check/sso 在会话有效时也可能返回 state=0，但仍带回 user_id，
+        因此只要拿到 user_id 即视为已登录；否则用真正会用到的业务接口兜底，
+        避免把可用会话误判成失效而跳过整轮任务。
+        """
         if not self._cookie:
             return False
         try:
@@ -810,13 +816,25 @@ class CloudAutoSearch(_PluginBase):
                 params={"_": int(time.time() * 1000)},
                 timeout=15,
             )
-            j = r.json()
-            if j.get("state") and j.get("data", {}).get("user_id"):
+            user_id = (r.json().get("data") or {}).get("user_id")
+            if user_id:
                 if not self._user_id:
-                    self._user_id = str(j["data"]["user_id"])
+                    self._user_id = str(user_id)
                 return True
         except Exception as e:
             logger.warning(f"115 RSS 离线下载：校验 115 登录态失败: {e}")
+
+        # 兜底：能正常调用文件接口即说明 Cookie 仍然可用。
+        try:
+            r = self._http_get(
+                "https://webapi.115.com/files/getid",
+                params={"path": "/"},
+                timeout=15,
+            )
+            if r.status_code == 200 and r.json().get("state"):
+                return bool(self._user_id)
+        except Exception as e:
+            logger.warning(f"115 RSS 离线下载：兜底校验 115 登录态失败: {e}")
         return False
 
 

@@ -505,3 +505,56 @@ class TestFolderPathResolution:
             {"title": "/动漫", "value": "11"},
         ]
         assert saved["folder_options"]["items"] == plugin._folder_options_cache
+
+class TestCheckLogin:
+    class _Resp:
+        def __init__(self, payload, status_code=200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self):
+            return self._payload
+
+    def test_state_zero_with_user_id_is_logged_in(self):
+        """实测 check/sso 会在有效会话下返回 state=0，但带 user_id。"""
+        plugin = cas.CloudAutoSearch()
+        plugin._cookie = "UID=u; CID=c; SEID=s"
+        plugin._user_id = ""
+        plugin._http_get = lambda *a, **k: self._Resp(
+            {"state": 0, "data": {"user_id": 4242}}
+        )
+        assert plugin._check_login() is True
+        assert plugin._user_id == "4242"
+
+    def test_falls_back_to_file_api_when_sso_has_no_user_id(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._cookie = "UID=u; CID=c; SEID=s"
+        plugin._user_id = "999"
+        seen = []
+
+        def fake_get(url, params=None, timeout=0):
+            seen.append(url)
+            if "check/sso" in url:
+                return self._Resp({"state": 0, "data": {}})
+            return self._Resp({"state": True, "id": 0})
+
+        plugin._http_get = fake_get
+        assert plugin._check_login() is True
+        assert any("files/getid" in u for u in seen)
+
+    def test_returns_false_when_session_really_invalid(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._cookie = "UID=u; CID=c; SEID=s"
+        plugin._user_id = "999"
+        plugin._http_get = lambda *a, **k: self._Resp(
+            {"state": False, "data": {}}
+        )
+        assert plugin._check_login() is False
+
+    def test_no_cookie_short_circuits(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._cookie = ""
+        plugin._http_get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not access network without cookie")
+        )
+        assert plugin._check_login() is False
