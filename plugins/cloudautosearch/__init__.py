@@ -633,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.10"
+    plugin_version = "1.0.11"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -677,7 +677,9 @@ class CloudAutoSearch(_PluginBase):
             self._exclude_keywords = config.get("exclude_keywords") or ""
             self._min_size_gb = config.get("min_size_gb") or ""
             self._max_size_gb = config.get("max_size_gb") or ""
-            self._target_folder_id = config.get("target_folder_id") or ""
+            self._target_folder_id = self._normalize_folder_input(
+                config.get("target_folder_id")
+            )
             credential = self.get_data("credential") or {}
             self._cookie = credential.get("cookie") or config.get("cookie") or ""
             self._user_id = credential.get("user_id") or config.get("user_id") or ""
@@ -895,9 +897,24 @@ class CloudAutoSearch(_PluginBase):
             })
         return fallback
 
-    def _resolve_target_folder_id(self, folder: Optional[str] = None) -> str:
+    @staticmethod
+    def _normalize_folder_input(value: Any) -> str:
+        """VCombobox 选中候选项时回传整个 {title, value} 对象，需取出真实值。"""
+        if isinstance(value, dict):
+            for key in ("value", "id", "title"):
+                picked = value.get(key)
+                if picked not in (None, ""):
+                    return str(picked).strip()
+            return ""
+        if isinstance(value, (list, tuple)):
+            return CloudAutoSearch._normalize_folder_input(value[0]) if value else ""
+        return str(value or "").strip()
+
+    def _resolve_target_folder_id(self, folder: Optional[Any] = None) -> str:
         """将下拉值、目录名称或 115 完整路径解析成目录 ID。"""
-        raw = str(self._target_folder_id if folder is None else folder).strip()
+        raw = self._normalize_folder_input(
+            self._target_folder_id if folder is None else folder
+        )
         if not raw or raw == "/":
             return "0"
         if raw.isdigit():

@@ -558,3 +558,35 @@ class TestCheckLogin:
             AssertionError("must not access network without cookie")
         )
         assert plugin._check_login() is False
+
+class TestComboboxObjectValue:
+    def test_selected_option_object_resolves_to_its_id(self):
+        """VCombobox 选中候选项会回传 {title, value}，必须取到真实目录 ID。"""
+        plugin = cas.CloudAutoSearch()
+        plugin._http_get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("object with id must not access network")
+        )
+        selected = {"title": "/云下载", "value": "3401155856685858217"}
+        assert plugin._resolve_target_folder_id(selected) == "3401155856685858217"
+
+    def test_object_without_value_falls_back_to_title_path(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._folder_options_cache = [{"title": "/云下载", "value": "42"}]
+        plugin._http_get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("cache hit must not access network")
+        )
+        assert plugin._resolve_target_folder_id({"title": "/云下载"}) == "42"
+
+    def test_init_plugin_normalizes_object_config(self):
+        plugin = cas.CloudAutoSearch()
+        assert plugin._normalize_folder_input(
+            {"title": "/云下载", "value": "777"}
+        ) == "777"
+        assert plugin._normalize_folder_input("/下载/动漫") == "/下载/动漫"
+        assert plugin._normalize_folder_input(None) == ""
+
+    def test_object_value_is_not_silently_downgraded_to_root(self):
+        """回归：旧版本会把对象退化成根目录 0，导致下载到错误位置。"""
+        plugin = cas.CloudAutoSearch()
+        selected = {"title": "/云下载", "value": "3401155856685858217"}
+        assert plugin._resolve_target_folder_id(selected) != "0"
