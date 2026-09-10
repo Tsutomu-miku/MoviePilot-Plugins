@@ -427,7 +427,7 @@ class TestNonBlockingFolderForm:
         )
         form, defaults = plugin.get_form()
         assert defaults["target_folder_id"] == plugin._target_folder_id
-        assert "VAutocomplete" in str(form)
+        assert "VCombobox" in str(form)
         assert "/动漫" in str(form)
 
     def test_empty_cache_returns_immediately_with_root(self):
@@ -437,3 +437,71 @@ class TestNonBlockingFolderForm:
         assert plugin._get_folder_options() == [
             {"title": "根目录 /", "value": "0"}
         ]
+
+class TestFolderPathResolution:
+    def test_numeric_id_never_accesses_network(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._http_get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("numeric id must not access network")
+        )
+        assert plugin._resolve_target_folder_id("12345") == "12345"
+        assert plugin._resolve_target_folder_id("/") == "0"
+
+    def test_unique_name_resolves_from_cache(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._folder_options_cache = [
+            {"title": "根目录 /", "value": "0"},
+            {"title": "/下载/动漫", "value": "11"},
+        ]
+        plugin._http_get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("cache hit must not access network")
+        )
+        assert plugin._resolve_target_folder_id("动漫") == "11"
+        assert plugin._resolve_target_folder_id("/下载/动漫") == "11"
+
+    def test_duplicate_name_requires_full_path(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._folder_options_cache = [
+            {"title": "/下载/动漫", "value": "11"},
+            {"title": "/归档/动漫", "value": "22"},
+        ]
+        with pytest.raises(RuntimeError, match="同名目录"):
+            plugin._resolve_target_folder_id("动漫")
+        assert plugin._resolve_target_folder_id("/归档/动漫") == "22"
+
+    def test_full_path_uses_getid_api(self):
+        class Response:
+            status_code = 200
+            @staticmethod
+            def json():
+                return {"state": True, "id": 7788}
+
+        plugin = cas.CloudAutoSearch()
+        calls = []
+        plugin._http_get = lambda url, params=None, timeout=0: (
+            calls.append((url, params, timeout)) or Response()
+        )
+        assert plugin._resolve_target_folder_id("/下载/动漫") == "7788"
+        assert calls == [(
+            "https://webapi.115.com/files/getid",
+            {"path": "/下载/动漫"},
+            20,
+        )]
+
+    def test_root_only_refresh_does_not_recurse(self):
+        plugin = cas.CloudAutoSearch()
+        plugin._folder_options_cache = []
+        plugin._folder_cache_updated_at = ""
+        saved = {}
+        calls = []
+        plugin._fetch_folder_children = lambda parent: (
+            calls.append(parent) or [{"id": "11", "name": "动漫"}]
+        )
+        plugin.save_data = lambda key, value: saved.update({key: value})
+        plugin._refresh_folder_cache()
+        assert calls == ["0"]
+        assert plugin._folder_options_cache == [
+            {"title": "根目录 /", "value": "0"},
+            {"title": "/动漫", "value": "11"},
+        ]
+        assert saved["folder_options"]["items"] == plugin._folder_options_cache

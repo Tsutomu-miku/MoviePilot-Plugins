@@ -633,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -872,10 +872,59 @@ class CloudAutoSearch(_PluginBase):
         fallback = [{"title": "根目录 /", "value": "0"}]
         if self._target_folder_id and self._target_folder_id != "0":
             fallback.append({
-                "title": "当前已保存目录（目录缓存正在后台刷新）",
+                "title": str(self._target_folder_id),
                 "value": str(self._target_folder_id),
             })
         return fallback
+
+    def _resolve_target_folder_id(self, folder: Optional[str] = None) -> str:
+        """将下拉值、目录名称或 115 完整路径解析成目录 ID。"""
+        raw = str(self._target_folder_id if folder is None else folder).strip()
+        if not raw or raw == "/":
+            return "0"
+        if raw.isdigit():
+            return raw
+
+        # 优先命中本地缓存：既支持完整路径，也支持唯一目录名称。
+        exact = []
+        basename = []
+        raw_lower = raw.rstrip("/").lower()
+        for option in self._get_folder_options():
+            title = str(option.get("title") or "").strip()
+            value = str(option.get("value") or "").strip()
+            if not title or not value:
+                continue
+            normalized = title.replace("根目录 ", "").rstrip("/") or "/"
+            if normalized.lower() == raw_lower:
+                exact.append(value)
+            if normalized.rsplit("/", 1)[-1].lower() == raw_lower:
+                basename.append(value)
+        if exact:
+            return exact[0]
+        if len(set(basename)) == 1:
+            return basename[0]
+        if len(set(basename)) > 1:
+            raise RuntimeError("存在同名目录，请输入 115 完整路径")
+
+        # 未命中缓存时按完整路径实时解析；裸名称按根目录下的目录处理。
+        path = raw if raw.startswith("/") else f"/{raw}"
+        r = self._http_get(
+            "https://webapi.115.com/files/getid",
+            params={"path": path},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"目录路径解析 HTTP {r.status_code}")
+        try:
+            payload = r.json()
+        except Exception as e:
+            raise RuntimeError("目录路径解析返回非 JSON") from e
+        if not payload.get("state") or payload.get("id") is None:
+            raise RuntimeError(
+                payload.get("error") or payload.get("message")
+                or f"找不到 115 目录：{path}"
+            )
+        return str(payload.get("id"))
 
     def _start_folder_refresh(self) -> bool:
         """启动单个后台目录刷新任务；配置页无需等待。"""
@@ -885,10 +934,17 @@ class CloudAutoSearch(_PluginBase):
         return True
 
     def _refresh_folder_cache(self):
+        """只缓存根目录建议；子目录可直接输入完整路径，避免递归触发 115 风控。"""
         if not self._folder_refresh_lock.acquire(blocking=False):
             return
         try:
-            options = build_115_folder_options(self._fetch_folder_children)
+            folders = self._fetch_folder_children("0")
+            options = [{"title": "根目录 /", "value": "0"}]
+            options.extend(
+                {"title": f"/{item['name']}", "value": str(item["id"])}
+                for item in folders
+                if item.get("id") and item.get("name")
+            )
             updated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._folder_options_cache = options
             self._folder_cache_updated_at = updated_at
@@ -896,9 +952,12 @@ class CloudAutoSearch(_PluginBase):
                 "items": options,
                 "updated_at": updated_at,
             })
-            logger.info(f"115 RSS 离线下载：已后台缓存 {len(options)} 个 115 目录")
+            logger.info(
+                f"115 RSS 离线下载：已缓存 {len(options)} 个根目录建议；"
+                "子目录可直接输入完整路径"
+            )
         except Exception as e:
-            logger.warning(f"115 RSS 离线下载：后台刷新 115 目录失败: {e}")
+            logger.warning(f"115 RSS 离线下载：后台刷新 115 根目录失败: {e}")
         finally:
             self._folder_refresh_lock.release()
 
@@ -910,9 +969,10 @@ class CloudAutoSearch(_PluginBase):
             return False
         try:
             key = generate_key()
+            target_folder_id = self._resolve_target_folder_id()
             payload = {
                 "ac": "add_task_urls",
-                "wp_path_id": self._target_folder_id,
+                "wp_path_id": target_folder_id,
                 "app_ver": "27.0.5.7",
                 "uid": str(self._user_id),
                 "url[0]": magnet,
@@ -1233,10 +1293,8 @@ class CloudAutoSearch(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         folder_options = self._get_folder_options()
         folder_hint = (
-            f"已缓存 {len(folder_options)} 个 115 目录，可输入名称搜索；"
-            f"更新时间：{self._folder_cache_updated_at or '后台刷新中'}。"
-            if len(folder_options) > 1
-            else "目录正在后台加载；配置页不会等待，请稍后重新打开。"
+            f"可选择已缓存目录，也可直接输入完整路径（如 /下载/动漫）；"
+            f"缓存更新时间：{self._folder_cache_updated_at or '后台刷新中'}。"
         )
         return [
             {
@@ -1366,15 +1424,15 @@ class CloudAutoSearch(_PluginBase):
                         "content": [
                             {"component": "VRow", "class": "mb-2", "content": [
                                 {"component": "VCol", "props": {"cols": 12}, "content": [
-                                    {"component": "VAutocomplete", "props": {
+                                    {"component": "VCombobox", "props": {
                                         "model": "target_folder_id",
-                                        "label": "115 目标目录",
+                                        "label": "115 目标目录（可选或输入完整路径）",
                                         "items": folder_options,
                                         "variant": "outlined",
                                         "clearable": False,
                                         "persistent-hint": True,
                                         "hint": folder_hint,
-                                        "no-data-text": "未找到匹配目录"}}]}]},
+                                        "no-data-text": "可直接输入 /下载/动漫"}}]}]},
                         ],
                     },
                 ],
