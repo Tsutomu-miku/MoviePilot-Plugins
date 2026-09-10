@@ -633,7 +633,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -827,7 +827,7 @@ class CloudAutoSearch(_PluginBase):
         page_size = 1000
         while True:
             r = self._http_get(
-                "https://webapi.115.com/files",
+                "https://aps.115.com/natsort/files.php",
                 params={
                     "aid": 1,
                     "cid": str(parent_id or "0"),
@@ -836,12 +836,20 @@ class CloudAutoSearch(_PluginBase):
                     "cur": 1,
                     "limit": page_size,
                     "offset": offset,
-                    "o": "file_name",
+                    "fc_mix": 0,
                     "asc": 1,
                 },
                 timeout=20,
             )
-            payload = r.json()
+            if r.status_code != 200:
+                raise RuntimeError(f"目录接口 HTTP {r.status_code}")
+            try:
+                payload = r.json()
+            except Exception as e:
+                content_type = r.headers.get("content-type", "")
+                raise RuntimeError(
+                    f"目录接口返回非 JSON（{content_type or '未知类型'}）"
+                ) from e
             if not payload.get("state"):
                 raise RuntimeError(payload.get("error") or payload.get("message") or "读取目录失败")
             page = parse_115_folder_items(payload)
