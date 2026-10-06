@@ -21,6 +21,7 @@ CloudAutoSearch（115 RSS 离线下载）MoviePilot 插件
 """
 
 import base64
+import copy
 import datetime
 import hashlib
 import os
@@ -28,8 +29,11 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
+
+from .ui import render_dashboard
 
 # ----------------------------------------------------------------------------
 # MoviePilot / 第三方依赖。
@@ -240,13 +244,47 @@ def torrent_to_magnet(torrent_bytes: bytes) -> Tuple[str, str]:
 
 
 def extract_info_hash_from_magnet(magnet: str) -> Optional[str]:
-    """从 magnet 链接中提取 info_hash（小写 40 位十六进制），失败返回 None。"""
-    if not magnet:
+    """兼容十六进制、Base32 和 URL 编码的 BTIH，统一返回小写 SHA1。"""
+    if not isinstance(magnet, str):
         return None
-    m = re.search(r"urn:btih:([0-9a-fA-F]{40})", magnet)
-    if m:
-        return m.group(1).lower()
+    try:
+        parsed = urlsplit(magnet)
+        if parsed.scheme.lower() != "magnet":
+            return None
+        for xt in parse_qs(parsed.query).get("xt", []):
+            if not xt.lower().startswith("urn:btih:"):
+                continue
+            value = xt[9:]
+            if re.fullmatch(r"[0-9a-fA-F]{40}", value):
+                return value.lower()
+            if re.fullmatch(r"[a-zA-Z2-7]{32}", value):
+                return base64.b32decode(value.upper()).hex()
+    except (ValueError, TypeError):
+        pass
     return None
+
+
+def parse_manual_links(raw: str) -> List[str]:
+    """限制单批大小；保留每行，逐条报告非法链接及重复资源。"""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("请粘贴磁力链接或种子下载链接，每行一个")
+    if len(raw) > 65536:
+        raise ValueError("链接内容过长，请分批提交")
+    links = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(links) > 20:
+        raise ValueError("每批最多提交 20 条链接")
+    return links
+
+
+def validate_download_link(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() == "magnet":
+        if not extract_info_hash_from_magnet(url):
+            raise ValueError("磁力链接缺少有效的 BTIH（支持十六进制和 Base32）")
+    elif parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("仅支持 magnet、HTTP 或 HTTPS 种子下载链接")
+    elif parsed.username or parsed.password:
+        raise ValueError("请使用不包含账号密码的种子下载链接")
 
 
 # ============================================================================
@@ -629,11 +667,11 @@ class CloudAutoSearch(_PluginBase):
     # 插件名称
     plugin_name = "115 RSS 离线下载"
     # 插件描述
-    plugin_desc = "订阅 RSS 并自动提交种子到 115 离线下载"
+    plugin_desc = "订阅 RSS 自动下载，或手动粘贴链接推送到 115"
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.0.11"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -665,9 +703,24 @@ class CloudAutoSearch(_PluginBase):
     _qrcode_token: Dict[str, Any] = {}
     _folder_options_cache: List[dict] = []
     _folder_cache_updated_at: str = ""
+    _manual_state_lock = threading.Lock()
+    _manual_job: Dict[str, Any] = {}
+    _last_submit_error: str = ""
 
     # ------------------------------------------------------------------ init
     def init_plugin(self, config: Optional[dict] = None):
+        self._manual_job = self.get_data("manual_job") or {}
+        if self._manual_job.get("status") == "running":
+            self._manual_job["status"] = "failed"
+            self._manual_job["error"] = "插件已重载，请查看 115 离线任务后重试未完成的链接"
+            for item in self._manual_job.get("results", []):
+                if item.get("status") == "pending":
+                    item.update(status="failed", message="插件重载，提交结果未确认")
+            self._manual_job["failed"] = sum(
+                item.get("status") == "failed" for item in self._manual_job.get("results", [])
+            )
+            self._manual_job["end_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.save_data("manual_job", self._manual_job)
         if config:
             self._enabled = bool(config.get("enabled", False))
             self._onlyonce = bool(config.get("onlyonce", False))
@@ -764,7 +817,7 @@ class CloudAutoSearch(_PluginBase):
         if requests is None:
             raise RuntimeError("requests 库不可用")
         return requests.get(
-            url, params=params, headers=self._headers(), timeout=timeout,
+            url, params=params, headers=self._headers_for_url(url), timeout=timeout,
             **get_proxy_kwargs(getattr(settings, "PROXY_HOST", "")),
         )
 
@@ -773,9 +826,14 @@ class CloudAutoSearch(_PluginBase):
         if requests is None:
             raise RuntimeError("requests 库不可用")
         return requests.post(
-            url, params=params, data=data, headers=self._headers(), timeout=timeout,
+            url, params=params, data=data, headers=self._headers_for_url(url), timeout=timeout,
             **get_proxy_kwargs(getattr(settings, "PROXY_HOST", "")),
         )
+
+    def _headers_for_url(self, url: str) -> Dict[str, str]:
+        """115 凭据只发送给 115；RSS/种子站点不携带网盘 Cookie。"""
+        host = (urlsplit(url).hostname or "").lower()
+        return self._headers(with_cookie=host == "115.com" or host.endswith(".115.com"))
 
     # ------------------------------------------------------------- 115 login
     def _fetch_qrcode_token(self) -> Optional[Dict[str, Any]]:
@@ -997,14 +1055,17 @@ class CloudAutoSearch(_PluginBase):
             self._folder_refresh_lock.release()
 
     # ------------------------------------------------------- 115 offline task
-    def _submit_offline_task(self, magnet: str) -> bool:
+    def _submit_offline_task(self, magnet: str, target_folder_id: Optional[str] = None) -> bool:
         """通过 m115 加密提交 magnet 到 115 离线下载。成功返回 True。"""
+        self._last_submit_error = ""
         if not self._cookie or not self._user_id:
+            self._last_submit_error = "请先登录 115"
             logger.error("115 RSS 离线下载：未登录 115，无法提交离线任务")
             return False
         try:
             key = generate_key()
-            target_folder_id = self._resolve_target_folder_id()
+            if target_folder_id is None:
+                target_folder_id = self._resolve_target_folder_id()
             payload = {
                 "ac": "add_task_urls",
                 "wp_path_id": target_folder_id,
@@ -1023,6 +1084,7 @@ class CloudAutoSearch(_PluginBase):
                 data={"data": encrypted_b64},
                 timeout=30,
             )
+            r.raise_for_status()
             j = r.json()
             encoded_data = j.get("encoded_data") or ""
             if encoded_data:
@@ -1031,18 +1093,29 @@ class CloudAutoSearch(_PluginBase):
                     resp = json.loads(decoded.decode("utf-8", errors="replace"))
                     if resp.get("state"):
                         return True
-                    logger.warning(f"115 RSS 离线下载：115 返回失败: {resp}")
+                    self._last_submit_error = self._offline_error(resp)
+                    logger.warning(f"115 RSS 离线下载：{self._last_submit_error}")
+                    return False
                 except Exception:
+                    self._last_submit_error = "115 响应解密后解析失败"
                     logger.warning("115 RSS 离线下载：115 响应解密后解析失败")
                     return False
             # 兼容未加密响应
             if j.get("state"):
                 return True
-            logger.warning(f"115 RSS 离线下载：提交离线任务返回: {j}")
+            self._last_submit_error = self._offline_error(j)
+            logger.warning(f"115 RSS 离线下载：{self._last_submit_error}")
             return False
         except Exception as e:
+            self._last_submit_error = "115 提交异常，请检查网络或重新登录后重试"
             logger.error(f"115 RSS 离线下载：提交离线任务异常: {e}")
             return False
+
+    @staticmethod
+    def _offline_error(payload: dict) -> str:
+        message = (payload.get("error_msg") or payload.get("error")
+                   or payload.get("message") or "115 未接受该离线任务")
+        return str(message)[:300]
 
     # ----------------------------------------------------------------- runner
     def _parse_size_gb(self, raw: str) -> Optional[float]:
@@ -1056,24 +1129,26 @@ class CloudAutoSearch(_PluginBase):
         url = item.get("download_url") or ""
         if not url:
             return None, None
-        if url.startswith("magnet:"):
+        if url.lower().startswith("magnet:"):
             return url, extract_info_hash_from_magnet(url)
         # .torrent 链接：下载并解析
         try:
             r = self._http_get(url, timeout=30)
+            r.raise_for_status()
             magnet, _name = torrent_to_magnet(r.content)
             return magnet, extract_info_hash_from_magnet(magnet)
         except Exception as e:
-            logger.error(f"115 RSS 离线下载：解析 torrent 失败 {url}: {e}")
+            logger.error(f"115 RSS 离线下载：解析 torrent 失败（{type(e).__name__}）")
             return None, None
 
-    def _run_task(self, manual: bool = False):
-        if not self._run_lock.acquire(blocking=False):
+    def _run_task(self, manual: bool = False, lock_acquired: bool = False):
+        if not lock_acquired and not self._run_lock.acquire(blocking=False):
             logger.warning("115 RSS 离线下载：已有任务在运行，跳过本次")
             return
         stats = {
             "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "manual": manual,
+            "source": "rss",
             "rss_count": 0,
             "items_total": 0,
             "filtered": 0,
@@ -1091,6 +1166,7 @@ class CloudAutoSearch(_PluginBase):
                 return
 
             dedup_history: Dict[str, dict] = self.get_data("dedup_history") or {}
+            target_folder_id = self._resolve_target_folder_id()
 
             include_kw = parse_keywords(self._include_keywords)
             exclude_kw = parse_keywords(self._exclude_keywords)
@@ -1130,7 +1206,7 @@ class CloudAutoSearch(_PluginBase):
                         stats["duplicated"] += 1
                         continue
 
-                    ok = self._submit_offline_task(magnet)
+                    ok = self._submit_offline_task(magnet, target_folder_id)
                     if ok:
                         record_success(info_hash, item.get("title", ""), dedup_history)
                         self.save_data("dedup_history", dedup_history)
@@ -1150,6 +1226,8 @@ class CloudAutoSearch(_PluginBase):
                 f"115 RSS 离线下载：完成 共{stats['items_total']} 过滤{stats['filtered']} "
                 f"重复{stats['duplicated']} 成功{stats['submitted']} 失败{stats['failed']}"
             )
+            if stats["failed"]:
+                stats["status"] = "partial" if stats["submitted"] or stats["duplicated"] else "failed"
         except Exception as e:
             stats["status"] = "failed"
             stats["error"] = str(e)
@@ -1157,12 +1235,90 @@ class CloudAutoSearch(_PluginBase):
         finally:
             stats["end_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
-                run_log: List[dict] = self.get_data("run_log") or []
-                run_log.insert(0, stats)
-                self.save_data("run_log", run_log[:20])
+                self._save_run_stats(stats)
             except Exception:
                 pass
             self._run_lock.release()
+
+    def _save_run_stats(self, stats: dict):
+        run_log = self.get_data("run_log") or []
+        self.save_data("run_log", [stats] + run_log[:19])
+
+    def _manual_job_snapshot(self) -> dict:
+        with self._manual_state_lock:
+            return copy.deepcopy(self._manual_job)
+
+    def _update_manual_job(self, **changes):
+        with self._manual_state_lock:
+            self._manual_job.update(changes)
+            self.save_data("manual_job", copy.deepcopy(self._manual_job))
+
+    def _run_manual_links(self, links: List[str], folder: str, force: bool):
+        """锁在 API 中取得；后台工作不依赖 RSS 开关和过滤条件。"""
+        job = self._manual_job_snapshot()
+        results = job["results"]
+        submitted = failed = duplicated = 0
+        error = ""
+        try:
+            if not self._check_login():
+                raise RuntimeError("115 未登录或登录已失效，请重新登录")
+            # 一批只解析一次目标目录，配置变化不影响已开始的提交。
+            target_folder_id = self._resolve_target_folder_id(folder)
+            history = self.get_data("dedup_history") or {}
+            seen = set()
+            for index, link in enumerate(links):
+                result = results[index]
+                try:
+                    validate_download_link(link)
+                    magnet, info_hash = self._resolve_magnet({"download_url": link})
+                    if not magnet or not info_hash:
+                        raise ValueError("无法解析种子，请确认是可直接下载的 .torrent 链接")
+                    title = (parse_qs(urlsplit(magnet).query).get("dn") or [info_hash])[0]
+                    result["title"] = title[:200]
+                    if info_hash in seen or (not force and is_deduped(info_hash, history)):
+                        duplicated += 1
+                        result.update(status="duplicated", message="此前已成功推送，已跳过")
+                    elif self._submit_offline_task(magnet, target_folder_id):
+                        record_success(info_hash, title[:200], history)
+                        self.save_data("dedup_history", history)
+                        submitted += 1
+                        seen.add(info_hash)
+                        result.update(status="success", message="115 已接受离线任务")
+                    else:
+                        raise RuntimeError(self._last_submit_error or "115 提交失败，可重试")
+                except Exception as exc:
+                    failed += 1
+                    result.update(status="failed", message=str(exc)[:300])
+                self._update_manual_job(
+                    results=copy.deepcopy(results), submitted=submitted,
+                    failed=failed, duplicated=duplicated,
+                )
+        except Exception as exc:
+            error = str(exc)[:300]
+            for result in results:
+                if result["status"] == "pending":
+                    failed += 1
+                    result.update(status="failed", message=error)
+        finally:
+            try:
+                status = "partial" if failed and (submitted or duplicated) else (
+                    "failed" if failed else "success"
+                )
+                end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._update_manual_job(
+                    status=status, error=error, end_time=end_time,
+                    results=copy.deepcopy(results), submitted=submitted,
+                    failed=failed, duplicated=duplicated,
+                )
+                self._save_run_stats({
+                    "start_time": job["start_time"], "end_time": end_time,
+                    "manual": True, "source": "manual_links", "rss_count": 0,
+                    "items_total": len(links), "filtered": 0,
+                    "submitted": submitted, "failed": failed,
+                    "duplicated": duplicated, "status": status, "error": error,
+                })
+            finally:
+                self._run_lock.release()
 
     # ------------------------------------------------------------------ API
     def api_qrcode(self):
@@ -1265,12 +1421,71 @@ class CloudAutoSearch(_PluginBase):
                 "folder_count": len(self._folder_options_cache or []),
                 "folder_cache_updated_at": self._folder_cache_updated_at,
                 "folder_refreshing": self._folder_refresh_lock.locked(),
+                "enabled": self._enabled,
+                "cron": self._cron,
+                "running": self._run_lock.locked(),
+                "target_folder": self._target_folder_label(),
+                "manual_job": self._manual_job_snapshot(),
             },
         )
 
+    def api_manual_submit(self, payload: dict):
+        try:
+            links = parse_manual_links(payload.get("links"))
+            force = payload.get("force", False)
+            if not isinstance(force, bool):
+                raise ValueError("重新提交选项必须为布尔值")
+        except (ValueError, AttributeError) as exc:
+            return schemas.Response(success=False, message=str(exc))
+        if not self._run_lock.acquire(blocking=False):
+            return schemas.Response(success=False, message="已有任务在运行，请稍后重试")
+        try:
+            job = {
+                "id": uuid.uuid4().hex,
+                "status": "running", "submitted": 0, "failed": 0, "duplicated": 0,
+                "start_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "target_folder": self._target_folder_label(),
+                "results": [{"index": i + 1, "title": f"链接 {i + 1}",
+                             "status": "pending", "message": "等待提交"}
+                            for i in range(len(links))],
+            }
+            self._update_manual_job(**job)
+            threading.Thread(
+                target=self._run_manual_links,
+                args=(links, self._target_folder_id, force), daemon=True,
+            ).start()
+            return schemas.Response(success=True, data=job, message="已开始手动推送")
+        except Exception:
+            self._run_lock.release()
+            for result in job["results"]:
+                result.update(status="failed", message="无法启动任务，请重试")
+            try:
+                self._update_manual_job(status="failed", error="无法启动任务，请重试",
+                                        failed=len(links), results=job["results"])
+            except Exception:
+                logger.error("115 RSS 离线下载：无法保存手动任务启动失败记录")
+            return schemas.Response(success=False, message="无法启动任务，请重试")
+
+    def api_manual_status(self):
+        return schemas.Response(success=True, data=self._manual_job_snapshot())
+
+    def _target_folder_label(self) -> str:
+        raw = self._normalize_folder_input(self._target_folder_id)
+        for option in self._get_folder_options():
+            if str(option.get("value")) == (raw or "0"):
+                return str(option.get("title") or raw)
+        return raw or "根目录 /"
+
     def api_run(self):
-        threading.Thread(target=self._run_task, kwargs={"manual": True}, daemon=True).start()
-        return schemas.Response(success=True, message="已触发手动运行")
+        if not self._run_lock.acquire(blocking=False):
+            return schemas.Response(success=False, message="已有任务在运行，请稍后重试")
+        try:
+            threading.Thread(target=self._run_task,
+                             kwargs={"manual": True, "lock_acquired": True}, daemon=True).start()
+            return schemas.Response(success=True, message="已触发手动运行 RSS")
+        except Exception:
+            self._run_lock.release()
+            return schemas.Response(success=False, message="无法启动 RSS 任务，请重试")
 
     def api_refresh_folders(self):
         if not self._cookie or not self._user_id:
@@ -1319,6 +1534,10 @@ class CloudAutoSearch(_PluginBase):
              "auth": "bear", "summary": "插件状态"},
             {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
              "auth": "bear", "summary": "手动触发运行"},
+            {"path": "/manual_submit", "endpoint": self.api_manual_submit,
+             "methods": ["POST"], "auth": "bear", "summary": "手动推送链接到 115"},
+            {"path": "/manual_status", "endpoint": self.api_manual_status,
+             "methods": ["GET"], "auth": "bear", "summary": "手动推送进度及结果"},
             {"path": "/refresh_folders", "endpoint": self.api_refresh_folders,
              "methods": ["POST"], "auth": "bear", "summary": "后台刷新 115 目录缓存"},
             {"path": "/test_rss", "endpoint": self.api_test_rss, "methods": ["POST"],
@@ -1485,47 +1704,9 @@ class CloudAutoSearch(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        run_log = self.get_data("run_log") or []
-        if not run_log:
-            return [
-                {"component": "VAlert", "props": {
-                    "type": "info", "variant": "tonal",
-                    "text": "暂无运行记录"}}
-            ]
-        rows = []
-        for r in run_log[:10]:
-            rows.append({
-                "component": "tr",
-                "content": [
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "content": [{"component": "span", "text": str(r.get("start_time", ""))}]},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "content": [{"component": "span", "text": str(r.get("status", ""))}]},
-                    {"component": "td", "props": {"class": "text-caption"},
-                     "content": [{"component": "span",
-                                  "text": f"提交 {r.get('submitted',0)} / 失败 {r.get('failed',0)} / 重复 {r.get('duplicated',0)}"}]},
-                ],
-            })
-        return [
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-h6 py-2"},
-                     "content": [{"component": "span", "text": "最近运行记录"}]},
-                    {"component": "VTable", "props": {"density": "compact"},
-                     "content": [
-                         {"component": "thead", "content": [{
-                             "component": "tr", "content": [
-                                 {"component": "th", "content": [{"component": "span", "text": "时间"}]},
-                                 {"component": "th", "content": [{"component": "span", "text": "状态"}]},
-                                 {"component": "th", "content": [{"component": "span", "text": "统计"}]},
-                             ]}]},
-                         {"component": "tbody", "content": rows},
-                     ]},
-                ],
-            }
-        ]
+        return render_dashboard(
+            self.api_status().data, self.get_data("run_log") or []
+        )
 
     def stop_service(self):
         if self._scheduler:
