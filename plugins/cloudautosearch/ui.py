@@ -174,7 +174,7 @@ def render_dashboard(state: dict, run_log: list) -> list:
     ]
     if not state["logged_in"]:
         context.insert(0, {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "class": "mb-4",
-                           "text": "尚未保存 115 登录凭据，请先打开插件配置完成登录。"}})
+                           "text": "尚未保存 115 登录凭据，请先完成 115 登录后再推送。"}})
     job = state.get("manual_job") or {}
     if job.get("status") == "running":
         context.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mb-4",
