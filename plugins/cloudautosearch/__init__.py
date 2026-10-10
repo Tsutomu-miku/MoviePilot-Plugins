@@ -33,7 +33,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .ui import render_dashboard
+from .ui import login_panel, render_dashboard
 
 # ----------------------------------------------------------------------------
 # MoviePilot / 第三方依赖。
@@ -609,7 +609,7 @@ def extract_login_cookie(payload: dict) -> Tuple[str, str]:
     cookie = "; ".join(
         f"{key}={cookie_data[key]}" for key in ordered_keys if cookie_data.get(key)
     )
-    return cookie, str(cookie_data.get("UID", ""))
+    return cookie, str(cookie_data["UID"]).split("_", 1)[0]
 
 
 def parse_115_folder_items(payload: dict) -> List[Dict[str, str]]:
@@ -671,7 +671,7 @@ class CloudAutoSearch(_PluginBase):
     # 插件图标
     plugin_icon = ""
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "Tsutomu"
     # 作者主页
@@ -862,41 +862,61 @@ class CloudAutoSearch(_PluginBase):
             return ""
 
     def _check_login(self) -> bool:
-        """校验 115 登录态。
-
-        实测 check/sso 在会话有效时也可能返回 state=0，但仍带回 user_id，
-        因此只要拿到 user_id 即视为已登录；否则用真正会用到的业务接口兜底，
-        避免把可用会话误判成失效而跳过整轮任务。
-        """
+        """以离线业务接口校验凭据，网页登录态不能决定离线是否可用。"""
         if not self._cookie:
+            self._save_login_status("missing", "尚未保存 115 登录凭据，请扫码登录")
             return False
         try:
-            r = self._http_get(
-                "https://passportapi.115.com/app/1.0/web/1.0/check/sso",
-                params={"_": int(time.time() * 1000)},
-                timeout=15,
-            )
-            user_id = (r.json().get("data") or {}).get("user_id")
-            if user_id:
-                if not self._user_id:
+            if not self._user_id:
+                response = self._http_get(
+                    "https://passportapi.115.com/app/1.0/web/1.0/check/sso",
+                    timeout=15,
+                )
+                user_id = (response.json().get("data") or {}).get("user_id")
+                if user_id:
                     self._user_id = str(user_id)
-                return True
-        except Exception as e:
-            logger.warning(f"115 RSS 离线下载：校验 115 登录态失败: {e}")
+            if not self._user_id:
+                self._save_login_status("invalid", "登录凭据不完整，请重新扫码登录")
+                return False
 
-        # 兜底：能正常调用文件接口即说明 Cookie 仍然可用。
-        try:
-            r = self._http_get(
-                "https://webapi.115.com/files/getid",
-                params={"path": "/"},
+            response = self._http_get(
+                "https://115.com/web/lixian/",
+                params={"ct": "lixian", "ac": "task_lists", "page": 1},
                 timeout=15,
             )
-            if r.status_code == 200 and r.json().get("state"):
-                return bool(self._user_id)
-        except Exception as e:
-            logger.warning(f"115 RSS 离线下载：兜底校验 115 登录态失败: {e}")
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("state"):
+                self._save_login_status("valid", "115 离线接口可用")
+                return True
+
+            message = self._offline_error(payload)
+            code = payload.get("errno", payload.get("errcode"))
+            if str(code) == "990001" or "登录" in message:
+                self._save_login_status("invalid", "115 离线登录已失效，请重新扫码登录")
+            else:
+                self._save_login_status("error", "115 离线接口拒绝校验：" + message)
+        except Exception as error:
+            self._save_login_status("error", "无法校验 115 离线接口，请检查网络后重试")
+            logger.warning(f"115 RSS 离线下载：登录校验请求失败 ({type(error).__name__})")
         return False
 
+    def _save_login_status(self, state: str, message: str):
+        self.save_data("login_status", {
+            "state": state,
+            "message": message,
+            "checked_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+    def _login_status(self) -> dict:
+        if not self._cookie:
+            return {"state": "missing", "message": "尚未保存 115 登录凭据"}
+        return self.get_data("login_status") or {
+            "state": "unchecked", "message": "已保存凭据，尚未校验离线接口",
+        }
+
+    def _login_error(self) -> str:
+        return self._login_status().get("message") or "115 离线登录不可用，请检查状态或重新扫码"
 
     def _fetch_folder_children(self, parent_id: str) -> List[Dict[str, str]]:
         """分页获取指定 115 目录下的直属子目录。"""
@@ -1160,9 +1180,9 @@ class CloudAutoSearch(_PluginBase):
         }
         try:
             if not self._check_login():
-                logger.warning("115 RSS 离线下载：115 未登录或登录态失效，跳过")
+                logger.warning(f"115 RSS 离线下载：{self._login_error()}，跳过")
                 stats["status"] = "skipped"
-                stats["error"] = "未登录"
+                stats["error"] = self._login_error()
                 return
 
             dedup_history: Dict[str, dict] = self.get_data("dedup_history") or {}
@@ -1261,7 +1281,7 @@ class CloudAutoSearch(_PluginBase):
         error = ""
         try:
             if not self._check_login():
-                raise RuntimeError("115 未登录或登录已失效，请重新登录")
+                raise RuntimeError(self._login_error())
             # 一批只解析一次目标目录，配置变化不影响已开始的提交。
             target_folder_id = self._resolve_target_folder_id(folder)
             history = self.get_data("dedup_history") or {}
@@ -1326,8 +1346,10 @@ class CloudAutoSearch(_PluginBase):
         if not data:
             return schemas.Response(success=False, message="获取二维码失败")
         uid = data.get("uid", "")
+        if not uid or not data.get("time") or not data.get("sign"):
+            return schemas.Response(success=False, message="115 未返回完整扫码参数，请重试")
         self._qrcode_token = data
-        qr_content = data.get("qrcode", "")
+        qr_content = data.get("qrcode") or f"https://115.com/scan/dg-{uid}"
         image = self._qrcode_to_data_url(qr_content)
         return schemas.Response(
             success=True,
@@ -1344,6 +1366,10 @@ class CloudAutoSearch(_PluginBase):
         uid = uid or token.get("uid")
         if not uid:
             return schemas.Response(success=False, message="缺少 uid")
+        if uid != token.get("uid"):
+            return schemas.Response(success=False, message="二维码已刷新，请使用当前二维码")
+        if token.get("cookie_saved"):
+            return schemas.Response(success=True, data={"status": 2, "cookie_saved": True})
         try:
             r = self._http_get(
                 "https://qrcodeapi.115.com/get/status/",
@@ -1361,6 +1387,8 @@ class CloudAutoSearch(_PluginBase):
 
         status, status_message = parse_qrcode_status(j)
         result = {"status": status, "message": status_message}
+        if self._qrcode_token is not token:
+            return schemas.Response(success=False, message="二维码已刷新，请使用当前二维码")
 
         if status == 2:
             # 已确认登录，换取 cookie
@@ -1371,6 +1399,8 @@ class CloudAutoSearch(_PluginBase):
                     timeout=15,
                 )
                 j2 = r2.json()
+                if self._qrcode_token is not token:
+                    return schemas.Response(success=False, message="二维码已刷新，请使用当前二维码")
                 if j2.get("state"):
                     cookie, user_id = extract_login_cookie(j2)
                     if not cookie:
@@ -1378,17 +1408,20 @@ class CloudAutoSearch(_PluginBase):
                     else:
                         self._cookie = cookie
                         self._user_id = user_id
+                        self._username = str((j2.get("data") or {}).get("uname") or "")
                         self.save_data("credential", {
                             "cookie": self._cookie, "user_id": self._user_id,
                             "username": self._username,
                         })
                         self.__update_config()
+                        self._save_login_status("unchecked", "扫码登录成功，提交前会校验离线接口")
+                        token["cookie_saved"] = True
                         self._start_folder_refresh()
-                        logger.info(
-                            f"115 RSS 离线下载：115 扫码登录成功 cookie={mask_cookie(cookie)}"
-                        )
+                        logger.info("115 RSS 离线下载：115 扫码登录成功")
                         result["cookie_saved"] = True
                         result["user_id"] = self._user_id
+                else:
+                    return schemas.Response(success=False, message="115 未接受扫码登录，请重新扫码")
             except Exception as e:
                 result["message"] = f"登录换取 cookie 失败: {e}"
         return schemas.Response(success=True, data=result)
@@ -1398,6 +1431,8 @@ class CloudAutoSearch(_PluginBase):
         self._user_id = ""
         self._username = ""
         self.del_data("credential")
+        self.del_data("login_status")
+        self._qrcode_token = {}
         self.del_data("folder_options")
         self._folder_options_cache = []
         self._folder_cache_updated_at = ""
@@ -1409,10 +1444,14 @@ class CloudAutoSearch(_PluginBase):
         dedup_history = self.get_data("dedup_history") or {}
         run_log = self.get_data("run_log") or []
         rss_count = len([u for u in (self._rss_urls or "").splitlines() if u.strip()])
+        login = self._login_status()
         return schemas.Response(
             success=True,
             data={
-                "logged_in": bool(self._cookie),
+                "version": self.plugin_version,
+                "logged_in": bool(self._cookie) and login["state"] != "invalid",
+                "credential_saved": bool(self._cookie),
+                "login_status": login,
                 "username": self._username,
                 "user_id": self._user_id,
                 "last_run": run_log[0] if run_log else None,
@@ -1428,6 +1467,10 @@ class CloudAutoSearch(_PluginBase):
                 "manual_job": self._manual_job_snapshot(),
             },
         )
+
+    def api_check_login(self):
+        self._check_login()
+        return schemas.Response(success=True, data=self.api_status().data)
 
     def api_manual_submit(self, payload: dict):
         try:
@@ -1532,6 +1575,8 @@ class CloudAutoSearch(_PluginBase):
              "auth": "bear", "summary": "退出 115 登录"},
             {"path": "/status", "endpoint": self.api_status, "methods": ["GET"],
              "auth": "bear", "summary": "插件状态"},
+            {"path": "/check_login", "endpoint": self.api_check_login, "methods": ["POST"],
+             "auth": "bear", "summary": "校验 115 离线登录"},
             {"path": "/run", "endpoint": self.api_run, "methods": ["POST"],
              "auth": "bear", "summary": "手动触发运行"},
             {"path": "/manual_submit", "endpoint": self.api_manual_submit,
@@ -1551,6 +1596,7 @@ class CloudAutoSearch(_PluginBase):
             f"缓存更新时间：{self._folder_cache_updated_at or '后台刷新中'}。"
         )
         return [
+            {"component": "div", "html": login_panel(self.api_status().data)},
             {
                 "component": "VRow",
                 "content": [

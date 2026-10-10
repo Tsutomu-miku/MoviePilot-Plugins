@@ -354,7 +354,7 @@ class TestLoginCookieExtraction:
             }},
         })
         assert cookie == "UID=123_A1_1; CID=cid; SEID=seid; KID=kid"
-        assert user_id == "123_A1_1"
+        assert user_id == "123"
 
     def test_incomplete_cookie_is_rejected(self):
         assert cas.extract_login_cookie({
@@ -515,18 +515,21 @@ class TestCheckLogin:
         def json(self):
             return self._payload
 
-    def test_state_zero_with_user_id_is_logged_in(self):
-        """实测 check/sso 会在有效会话下返回 state=0，但带 user_id。"""
+        def raise_for_status(self):
+            assert self.status_code == 200
+
+    def test_sso_recovers_missing_user_id_but_offline_api_decides_login(self):
         plugin = cas.CloudAutoSearch()
         plugin._cookie = "UID=u; CID=c; SEID=s"
         plugin._user_id = ""
-        plugin._http_get = lambda *a, **k: self._Resp(
+        plugin._http_get = lambda url, **kwargs: self._Resp(
             {"state": 0, "data": {"user_id": 4242}}
+            if "check/sso" in url else {"state": True, "tasks": []}
         )
         assert plugin._check_login() is True
         assert plugin._user_id == "4242"
 
-    def test_falls_back_to_file_api_when_sso_has_no_user_id(self):
+    def test_offline_login_is_independent_of_web_and_file_login(self):
         plugin = cas.CloudAutoSearch()
         plugin._cookie = "UID=u; CID=c; SEID=s"
         plugin._user_id = "999"
@@ -534,13 +537,13 @@ class TestCheckLogin:
 
         def fake_get(url, params=None, timeout=0):
             seen.append(url)
-            if "check/sso" in url:
-                return self._Resp({"state": 0, "data": {}})
-            return self._Resp({"state": True, "id": 0})
+            assert "web/lixian" in url
+            assert params["ac"] == "task_lists"
+            return self._Resp({"state": True, "tasks": []})
 
         plugin._http_get = fake_get
         assert plugin._check_login() is True
-        assert any("files/getid" in u for u in seen)
+        assert len(seen) == 1
 
     def test_returns_false_when_session_really_invalid(self):
         plugin = cas.CloudAutoSearch()

@@ -8,6 +8,141 @@ STATUS_LABELS = {
     "duplicated": "已跳过重复",
 }
 
+LOGIN_LABELS = {
+    "missing": "未登录", "unchecked": "待校验", "valid": "离线接口可用",
+    "invalid": "离线登录已失效", "error": "暂时无法校验",
+}
+
+LOGIN_HANDLER = r"""
+const clicked = event.target.closest('[data-login-action]');
+if (clicked && this.contains(clicked)) {
+(async function(panel, action) {
+  if (panel._loginController) panel._loginController.abort();
+  const controller = new AbortController();
+  panel._loginController = controller;
+  const api = window.MoviePilotAPI;
+  const status = panel.querySelector('[data-login-status]');
+  const image = panel.querySelector('[data-login-image]');
+  const qr = panel.querySelector('[data-login-qr]');
+  const scan = panel.querySelector('[data-login-scan]');
+  const check = panel.querySelector('[data-login-check]');
+  const cancel = panel.querySelector('[data-login-cancel]');
+  function active() { return !controller.signal.aborted && panel.isConnected; }
+  function unwrap(response) {
+    if (!response.success) throw new Error(response.message || '115 请求失败，请重试');
+    return response.data;
+  }
+  function showState(state) {
+    const login = state.login_status;
+    status.textContent = login.message + (login.checked_at ? ' · ' + login.checked_at : '');
+    scan.textContent = state.credential_saved ? '重新扫码登录' : '扫码登录 115';
+  }
+  async function pause() {
+    await new Promise(resolve => {
+      function finish() {
+        clearTimeout(timer);
+        controller.signal.removeEventListener('abort', finish);
+        resolve();
+      }
+      const timer = setTimeout(finish, 1500);
+      controller.signal.addEventListener('abort', finish, {once:true});
+    });
+  }
+  qr.hidden = true;
+  image.removeAttribute('src');
+  scan.disabled = false;
+  check.disabled = false;
+  cancel.hidden = true;
+  if (!api) { status.textContent = '页面 API 未就绪，请重新打开插件页面'; return; }
+  scan.disabled = true;
+  check.disabled = true;
+  try {
+    if (action === 'cancel') {
+      const state = unwrap(await api.get('plugin/CloudAutoSearch/status'));
+      if (active()) showState(state);
+      return;
+    }
+    if (action === 'check') {
+      status.textContent = '正在校验 115 离线接口…';
+      const state = unwrap(await api.post('plugin/CloudAutoSearch/check_login', {}));
+      if (active()) showState(state);
+      return;
+    }
+    status.textContent = '正在获取二维码…';
+    const token = unwrap(await api.get('plugin/CloudAutoSearch/qrcode'));
+    if (!active()) return;
+    if (!token.image) throw new Error('服务器无法生成二维码，请检查 qrcode 依赖后重试');
+    image.src = token.image;
+    qr.hidden = false;
+    cancel.hidden = false;
+    scan.disabled = false;
+    status.textContent = '请使用 115 手机客户端扫码，并在手机上确认登录';
+    const deadline = Date.now() + 180000;
+    while (active() && Date.now() < deadline) {
+      await pause();
+      if (!active()) return;
+      const result = unwrap(await api.get('plugin/CloudAutoSearch/qrcode_status?uid=' + encodeURIComponent(token.uid)));
+      if (!active()) return;
+      if (result.cookie_saved) {
+        qr.hidden = true;
+        image.removeAttribute('src');
+        showState(unwrap(await api.get('plugin/CloudAutoSearch/status')));
+        return;
+      }
+      if (result.status === -1 || result.status === -2) {
+        throw new Error(result.status === -1 ? '二维码已过期，请重新扫码' : '已取消登录，可重新扫码');
+      }
+      if (result.status === 2) throw new Error(result.message || '未能保存登录凭据，请重新扫码');
+      status.textContent = result.status === 1 ? '已扫码，请在手机上确认登录' : '等待 115 手机客户端扫码';
+    }
+    if (active()) throw new Error('等待扫码超时，请重新扫码');
+  } catch (error) {
+    if (active()) status.textContent = error.message || '登录请求失败，请重试';
+  } finally {
+    if (panel._loginController === controller) {
+      scan.disabled = false;
+      check.disabled = false;
+      cancel.hidden = true;
+      qr.hidden = true;
+      image.removeAttribute('src');
+    }
+  }
+})(this, clicked.dataset.loginAction);
+}
+"""
+
+
+def login_panel(state: dict) -> str:
+    login = state["login_status"]
+    message = login["message"]
+    if login.get("checked_at"):
+        message += " · " + login["checked_at"]
+    scan = "重新扫码登录" if state["credential_saved"] else "扫码登录 115"
+    handler = escape(LOGIN_HANDLER, quote=True)
+    return f"""
+<style>
+.cas-login {{ border:1px solid rgba(var(--v-theme-on-surface),.18); border-radius:10px; padding:18px; margin-bottom:16px; }}
+.cas-login [data-login-status] {{ margin:8px 0 14px; font-size:.875rem; overflow-wrap:anywhere; }}
+.cas-login .cas-login-actions {{ display:flex; gap:12px; flex-wrap:wrap; }}
+.cas-login button {{ padding:10px 16px; border-radius:8px; font:inherit; cursor:pointer;
+  color:rgb(var(--v-theme-primary)); background:rgba(var(--v-theme-primary),.10); }}
+.cas-login button:focus-visible {{ outline:2px solid rgb(var(--v-theme-primary)); outline-offset:3px; }}
+.cas-login button:disabled {{ opacity:.5; cursor:wait; }}
+.cas-login [hidden] {{ display:none; }}
+.cas-login [data-login-qr] {{ margin-top:16px; }}
+.cas-login img {{ display:block; width:220px; max-width:100%; background:white; padding:10px; border-radius:8px; }}
+</style>
+<section class="cas-login" aria-label="115 账号登录" onclick="{handler}">
+  <strong>115 账号</strong>
+  <p data-login-status role="status" aria-live="polite">{escape(message)}</p>
+  <div class="cas-login-actions">
+    <button type="button" data-login-scan data-login-action="scan">{scan}</button>
+    <button type="button" data-login-check data-login-action="check">检查离线登录</button>
+    <button type="button" data-login-cancel data-login-action="cancel" hidden>取消扫码</button>
+  </div>
+  <div data-login-qr hidden><img data-login-image alt="使用 115 手机客户端扫描此二维码登录"></div>
+</section>"""
+
 # PageRender 的 events 仅支持固定参数，表单通过宿主的认证 API 读取用户输入。
 # 无需读取或拼接 token；服务端返回的标题及错误始终使用 textContent 显示。
 MANUAL_HANDLER = r"""
@@ -149,8 +284,8 @@ def _card(title, content):
 def render_dashboard(state: dict, run_log: list) -> list:
     """保留 MoviePilot 主题及移动端布局；所有运行状态使用中文。"""
     metrics = [
-        ("115 登录", "已保存登录" if state["logged_in"] else "未登录",
-         state.get("username") or ("提交前自动校验会话" if state["logged_in"] else "请先在配置页登录")),
+        ("115 登录", LOGIN_LABELS[state["login_status"]["state"]],
+         state["login_status"]["message"]),
         ("RSS 自动下载", "已启用" if state["enabled"] else "已暂停", f"{state['rss_count']} 个订阅"),
         ("成功推送记录", state["total_submitted"], "按资源去重计数"),
         ("当前任务", "运行中" if state["running"] else "空闲", "手动推送与 RSS 共用队列"),
@@ -174,12 +309,13 @@ def render_dashboard(state: dict, run_log: list) -> list:
     ]
     if not state["logged_in"]:
         context.insert(0, {"component": "VAlert", "props": {"type": "warning", "variant": "tonal", "class": "mb-4",
-                           "text": "尚未保存 115 登录凭据，请先完成 115 登录后再推送。"}})
+                           "text": state["login_status"]["message"] + "；可在上方扫码登录。"}})
     job = state.get("manual_job") or {}
     if job.get("status") == "running":
         context.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mb-4",
                         "text": "手动推送正在后台运行，点击“刷新进度”可继续查看。"}})
-    page = [{"component": "VRow", "content": columns}] + context
+    page = [{"component": "div", "html": login_panel(state)},
+            {"component": "VRow", "content": columns}] + context
     page.append(_card("手动推送", [{"component": "div", "html": manual_form(job)}]))
     rows = []
     for run in run_log[:10]:
